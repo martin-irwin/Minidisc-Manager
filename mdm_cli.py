@@ -39,9 +39,9 @@ STALL_SECONDS = 120            # between progress reports once the transfer runs
 # Seen on a Sony Hi-MD recorder (054c:0187, standard disc): a long write started right after deleting tracks took no data at all,
 # while the same write after the disc had been taken out and put back (or the recorder replugged) ran normally. NetMD has no command
 # that makes the recorder read the disc again, so after a delete mdm asks for that before the next write.
-REREAD_NOTE = ('Tracks were deleted from this disc, and this recorder can then refuse to take a new track until it has read the '
-               'disc again. Take the disc out and put it back in (or unplug the recorder and plug it in again), then run the same '
-               'command with --disc-reread. Replugging is noticed by itself.')
+REREAD_NOTE = ('Tracks were deleted from this disc: before writing, mdm add resets the recorder over USB (a replug done in software, '
+               'a few seconds), as two long writes stalled right after a delete. --disc-reread skips that (the disc was taken out and '
+               'put back already).')
 
 
 def state_path():
@@ -366,13 +366,20 @@ def cmd_add(d, args):
         for w in p.get(k) or []:
             print('  note: %s' % w)
     reread = d.netmd and d.reread_needed()
+    before_reset = list(d.tracks)
     if args.dry_run:
         if reread:
             print('note: ' + REREAD_NOTE)
         print('dry run: nothing was written')
         return
     if reread and not args.disc_reread:
-        die(REREAD_NOTE)
+        # Instead of asking for the disc to be taken out and put back: a replug done in software (mdm reset), then carry on.
+        print('tracks were deleted from this disc: resetting the recorder over USB first (a software replug, a few seconds)')
+        d.usb_reset()
+        d.mark_reread(False)
+        before_count = len(d.tracks)
+        if before_count != len(before_reset):
+            die('after the USB reset the disc shows %d tracks instead of %d; nothing was written' % (before_count, len(before_reset)))
     confirm('Write these to the disc?', args.yes)
     before = list(d.tracks)
     items = [{'path': f['path'], 'title': f.get('title') or '', 'artist': f.get('artist') or '', 'album': f.get('album') or ''} for f in files]
@@ -409,7 +416,7 @@ def cmd_delete(d, args):
     kept = [t for t in before if t['number'] not in nums]
     d.check(len(kept), [(t, i) for i, t in enumerate(kept, 1)])
     if d.netmd:
-        print('note: before adding tracks, take the disc out and put it back in (or replug the recorder); then use mdm add --disc-reread.')
+        print('note: the next mdm add resets the recorder over USB first (a few seconds); nothing to do by hand.')
 
 
 def cmd_rename(d, args):
