@@ -56,6 +56,8 @@ mdm save all --to ~/Music/from-disc --as flac
 
 Formats for `add`: `sp`, `lp2` or `lp4` on a standard disc; `auto`, `pcm`, `mp3`, `lp2`, `lp4`, `hisp`, `hilp` or `at3p` on a Hi-MD disc. After every change, mdm reads the disc back and checks that the tracks it shouldn't have touched are unchanged. With a standard disc in a Hi-MD recorder, mdm picks the recorder's standard-disc entry by itself. To choose one yourself, use `--device himd|netmd|N`.
 
+**Writing to a standard disc after deleting tracks.** On a Sony Hi-MD recorder (`054c:0187`), a long write started right after tracks were deleted stalled: the recorder took no data at all. The same write ran normally once the disc had been taken out and put back in. NetMD has no command that makes a recorder read its disc again, so after `mdm delete`, `mdm add` asks you to take the disc out and put it back (or replug the recorder), then to run it with `--disc-reread`. A replug is noticed automatically. A write that stalls anyway is stopped after 2 minutes without progress. Tracks that had finished are kept, and the recorder may answer "Rejected" until it is replugged.
+
 ## Load and fans
 
 Measured on a 2012 Mac mini (i7-3615QM, no usable GPU) running Omarchy:

@@ -22,6 +22,7 @@ import os
 import re
 import subprocess
 import sys
+import threading
 import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -29,6 +30,39 @@ sys.path.insert(0, HERE)
 
 FORMATS_NETMD = ('sp', 'lp2', 'lp4')
 FORMATS_HIMD = ('auto', 'pcm', 'mp3', 'lp2', 'lp4', 'hisp', 'hilp', 'at3p')
+
+# A write that gets no progress for this long is stopped (it does not come back by itself; the USB library would wait for hours).
+STALL_FIRST_SECONDS = 300      # before the first progress report: the files are prepared first
+STALL_SECONDS = 120            # between progress reports once the transfer runs (SP goes at about real time or faster)
+
+# Seen on a Sony Hi-MD recorder (054c:0187, standard disc): a long write started right after deleting tracks took no data at all,
+# while the same write after the disc had been taken out and put back (or the recorder replugged) ran normally. NetMD has no command
+# that makes the recorder read the disc again, so after a delete mdm asks for that before the next write.
+REREAD_NOTE = ('Tracks were deleted from this disc, and this recorder can then refuse to take a new track until it has read the '
+               'disc again. Take the disc out and put it back in (or unplug the recorder and plug it in again), then run the same '
+               'command with --disc-reread. Replugging is noticed by itself.')
+
+
+def state_path():
+    from mdm_platform import data_root
+    return os.path.join(data_root(HERE), 'MiniDiscManager', 'mdm-state.json')
+
+
+def state_load():
+    try:
+        with open(state_path(), encoding='utf-8') as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def state_save(state):
+    try:
+        os.makedirs(os.path.dirname(state_path()), exist_ok=True)
+        with open(state_path(), 'w', encoding='utf-8') as f:
+            json.dump(state, f)
+    except OSError:
+        pass
 
 
 def die(msg, code=1):
@@ -79,8 +113,30 @@ class ProgressLines:
     """Stands in for the window during an upload: the Api reports progress with evaluate_js('window.onUploadProgress(...)'); this prints
     one line per track and a line every 25 % of it, instead."""
 
-    def __init__(self, count):
+    def __init__(self, count, api=None):
         self.count, self.file, self.step = count, None, -1
+        self.api, self.last, self.started, self.stalled = api, time.time(), False, False
+        self._done = threading.Event()
+        if api is not None:
+            threading.Thread(target=self._watch, daemon=True).start()
+
+    def _watch(self):
+        """Stops the helper when the recorder takes no data for too long."""
+        while not self._done.wait(5):
+            limit = STALL_SECONDS if self.started else STALL_FIRST_SECONDS
+            if time.time() - self.last > limit:
+                self.stalled = True
+                print('  no progress for %d seconds: stopping the write' % limit)
+                proc = getattr(self.api, '_proc', None)
+                try:
+                    if proc and proc.poll() is None:
+                        proc.kill()
+                except OSError:
+                    pass
+                return
+
+    def stop(self):
+        self._done.set()
 
     def evaluate_js(self, js):
         m = re.search(r'onUploadProgress\((.*)\)\s*$', js, re.S)
@@ -90,6 +146,9 @@ class ProgressLines:
             msg = json.loads(m.group(1))
         except ValueError:
             return
+        self.last = time.time()
+        if msg.get('event') == 'progress':
+            self.started = True
         n = msg.get('file')
         if msg.get('event') in ('encoding', 'progress') and n is not None and n != self.file:
             self.file, self.step = n, -1
@@ -169,6 +228,27 @@ class Disc:
     def netmd(self):
         return self.devices[self.index]['mode'] == 'netmd'
 
+    def where(self):
+        """The recorder's USB id and place (bus, address). The address changes when it is unplugged and plugged in again."""
+        dev = self.api._devices[self.index]
+        return {'usb': self.devices[self.index]['usb'], 'bus': getattr(dev, 'bus', None), 'address': getattr(dev, 'address', None)}
+
+    def reread_needed(self):
+        """True when tracks were deleted on this recorder and it has not been replugged since."""
+        mark = state_load().get('needsReread')
+        if not mark or mark.get('usb') != self.devices[self.index]['usb']:
+            return False
+        now = self.where()
+        return (mark.get('bus'), mark.get('address')) == (now['bus'], now['address'])
+
+    def mark_reread(self, needed):
+        state = state_load()
+        if needed:
+            state['needsReread'] = dict(self.where(), at=time.strftime('%Y-%m-%d %H:%M:%S'))
+        else:
+            state.pop('needsReread', None)
+        state_save(state)
+
     @staticmethod
     def key(t):
         return (t.get('title'), t.get('artist'), t.get('album'), t.get('seconds'), t.get('codec'))
@@ -240,19 +320,30 @@ def cmd_add(d, args):
     for k in ('warnings', 'notes'):
         for w in p.get(k) or []:
             print('  note: %s' % w)
+    reread = d.netmd and d.reread_needed()
     if args.dry_run:
+        if reread:
+            print('note: ' + REREAD_NOTE)
         print('dry run: nothing was written')
         return
+    if reread and not args.disc_reread:
+        die(REREAD_NOTE)
     confirm('Write these to the disc?', args.yes)
     before = list(d.tracks)
     items = [{'path': f['path'], 'title': f.get('title') or '', 'artist': f.get('artist') or '', 'album': f.get('album') or ''} for f in files]
-    d.api._window = ProgressLines(len(items))
+    progress = ProgressLines(len(items), d.api)
+    d.api._window = progress
     try:
         res = d.api.upload(items, fmt=fmt)
     finally:
+        progress.stop()
         d.api._window = None
+    if progress.stalled:
+        die('the recorder stopped taking data, so the write was stopped. Tracks it had finished are kept. Unplug the recorder '
+            'and plug it in again (it can answer "Rejected" until then), check with: mdm show, and add the rest.')
     if res.get('error'):
         die('the upload failed: %s' % res['error'])
+    d.mark_reread(False)
     print('written: %s' % json.dumps(res.get('result') or res, ensure_ascii=False)[:200])
     d.check(len(before) + len(files), [(t, t['number']) for t in before])
 
@@ -266,10 +357,14 @@ def cmd_delete(d, args):
     confirm('Delete %d track%s from the disc?' % (len(nums), '' if len(nums) == 1 else 's'), args.yes)
     before = list(d.tracks)
     res = d.api.delete_tracks(d.index, nums)
+    if d.netmd:
+        d.mark_reread(True)                         # also when the delete reported a problem: the disc's track list may have changed
     if res.get('error'):
         die('the delete failed: %s' % res['error'])
     kept = [t for t in before if t['number'] not in nums]
     d.check(len(kept), [(t, i) for i, t in enumerate(kept, 1)])
+    if d.netmd:
+        print('note: before adding tracks, take the disc out and put it back in (or replug the recorder); then use mdm add --disc-reread.')
 
 
 def cmd_rename(d, args):
@@ -346,6 +441,8 @@ def main(argv=None):
     s.add_argument('--format', '-f')
     s.add_argument('--title', help='title for a single file (default: from its tags or name)')
     s.add_argument('--dry-run', action='store_true', help='show the plan only')
+    s.add_argument('--disc-reread', action='store_true',
+                   help='the disc was taken out and put back in since tracks were deleted (see mdm delete)')
     s = sub.add_parser('delete', help='delete tracks')
     s.add_argument('tracks', nargs='+')
     s = sub.add_parser('rename', help='rename a track')
