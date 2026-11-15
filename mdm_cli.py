@@ -131,8 +131,17 @@ class ProgressLines:
                 try:
                     if proc and proc.poll() is None:
                         proc.kill()
-                except OSError:
+                        proc.wait(10)
+                except (OSError, subprocess.TimeoutExpired):
                     pass
+                if proc:                                # the helper's prepared audio (mdm-<its pid>-*.wav), which it can no longer remove
+                    import glob
+                    import tempfile
+                    for path in glob.glob(os.path.join(tempfile.gettempdir(), 'mdm-%d-*' % proc.pid)):
+                        try:
+                            os.remove(path)
+                        except OSError:
+                            pass
                 return
 
     def stop(self):

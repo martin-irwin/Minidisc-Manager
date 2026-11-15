@@ -625,6 +625,15 @@ def _sweep_temp(min_age=300):
                     shutil.rmtree(path, ignore_errors=True)
             except OSError:
                 pass
+        # The helpers' audio files (mdm-<pid>-<random>.wav / .oma / .raw): removed by the helper itself, except when it was stopped
+        # from outside (a stalled write), which can leave hundreds of MB. Age only (no check of the process): no write lasts 12 hours.
+        elif re.fullmatch(r'mdm-\d+-[a-z0-9]+\.(wav|oma|raw|aea)', name):
+            path = os.path.join(base, name)
+            try:
+                if os.path.isfile(path) and now - os.path.getmtime(path) > 12 * 3600:
+                    os.remove(path)
+            except OSError:
+                pass
 
 
 WINDOW_FILE = os.path.join(data_root(HERE), 'MiniDiscManager', 'window.json')     # the window's size, place and maximised state
