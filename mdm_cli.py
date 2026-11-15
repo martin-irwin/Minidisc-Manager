@@ -4,6 +4,7 @@ Uses the program's own code (the same Api the window uses), so it does exactly w
 at a time: close MiniDisc Manager first, or add --close-gui.
 
   mdm devices                         the connected recorders
+  mdm reset                           reset the recorder over USB (like a replug) and read the disc again
   mdm show [--json]                   the disc: title, space and tracks
   mdm add FILES... [--format F]       add tracks (shows the plan first; F: sp lp2 lp4 on a standard disc,
                                       auto pcm mp3 lp2 lp4 hisp hilp at3p on a Hi-MD disc)
@@ -250,6 +251,41 @@ class Disc:
         now = self.where()
         return (mark.get('bus'), mark.get('address')) == (now['bus'], now['address'])
 
+    def usb_reset(self):
+        """A replug done in software: resets the recorder's USB port, waits for it to come back, scans again and reads the disc.
+        Whether this has the same effect as taking the disc out and back in is what `mdm reset` is for finding out."""
+        import usb.core
+        import usb.util
+        usb_id, mode = self.devices[self.index]['usb'], self.devices[self.index]['mode']
+        dev = self.api._devices[self.index]
+        before = (getattr(dev, 'bus', None), getattr(dev, 'address', None))
+        try:
+            dev.reset()
+        except (usb.core.USBError, NotImplementedError) as exc:     # a device that re-enumerates often reports itself gone here
+            print('  (reset: %s)' % exc)
+        try:
+            usb.util.dispose_resources(dev)
+        except usb.core.USBError:
+            pass
+        time.sleep(3)
+        for _ in range(20):
+            scan = self.api.scan()
+            hit = next((d for d in scan.get('devices') or [] if d['usb'] == usb_id and d['mode'] == mode), None)
+            if hit:
+                self.devices, self.index = scan['devices'], hit['index']
+                break
+            time.sleep(1)
+        else:
+            die('the recorder did not come back after the USB reset; unplug it and plug it in again')
+        now = self.api._devices[self.index]
+        print('USB reset done (bus %s address %s -> %s)' % (before[0], before[1], getattr(now, 'address', None)))
+        for _ in range(10):                                 # give the recorder time to read the disc
+            out = self.api.load(self.index)
+            if not out.get('error') and out.get('discState') != 'none':
+                break
+            time.sleep(2)
+        self.reload()
+
     def mark_reread(self, needed):
         state = state_load()
         if needed:
@@ -443,6 +479,7 @@ def main(argv=None):
     ap.add_argument('-y', '--yes', action='store_true', help='do not ask before writing to the disc')
     sub = ap.add_subparsers(dest='cmd', required=True)
     sub.add_parser('devices', help='the connected recorders')
+    sub.add_parser('reset', help='reset the recorder over USB (a replug done in software) and read the disc again')
     s = sub.add_parser('show', help='the disc and its tracks')
     s.add_argument('--json', action='store_true')
     s = sub.add_parser('add', help='add tracks from files')
@@ -483,6 +520,11 @@ def main(argv=None):
     if args.cmd == 'devices':
         for dev in d.devices:
             print('%d  %-40s %-6s %s' % (dev['index'], dev['name'], dev['mode'], dev['usb']))
+        return
+    if args.cmd == 'reset':
+        d.usb_reset()
+        d.mark_reread(False)
+        show(d)
         return
     {'show': lambda: show(d, args.json), 'add': lambda: cmd_add(d, args), 'delete': lambda: cmd_delete(d, args),
      'rename': lambda: cmd_rename(d, args), 'rename-disc': lambda: cmd_rename_disc(d, args), 'move': lambda: cmd_move(d, args),
