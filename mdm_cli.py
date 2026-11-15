@@ -75,6 +75,32 @@ def numbers(spec, count):
     return sorted(out)
 
 
+class ProgressLines:
+    """Stands in for the window during an upload: the Api reports progress with evaluate_js('window.onUploadProgress(...)'); this prints
+    one line per track and a line every 25 % of it, instead."""
+
+    def __init__(self, count):
+        self.count, self.file, self.step = count, None, -1
+
+    def evaluate_js(self, js):
+        m = re.search(r'onUploadProgress\((.*)\)\s*$', js, re.S)
+        if not m:
+            return
+        try:
+            msg = json.loads(m.group(1))
+        except ValueError:
+            return
+        n = msg.get('file')
+        if msg.get('event') in ('encoding', 'progress') and n is not None and n != self.file:
+            self.file, self.step = n, -1
+            print('  [%d/%d] %s' % (int(n) + 1 if isinstance(n, int) else n, self.count, msg.get('name') or ''))
+        if msg.get('event') == 'progress' and msg.get('total'):
+            step = int(4 * msg['done'] / msg['total'])
+            if step > self.step and 0 < step < 4:
+                self.step = step
+                print('         %d %%' % (25 * step))
+
+
 def confirm(question, assume_yes):
     if assume_yes:
         return
@@ -220,7 +246,11 @@ def cmd_add(d, args):
     confirm('Write these to the disc?', args.yes)
     before = list(d.tracks)
     items = [{'path': f['path'], 'title': f.get('title') or '', 'artist': f.get('artist') or '', 'album': f.get('album') or ''} for f in files]
-    res = d.api.upload(items, fmt=fmt)
+    d.api._window = ProgressLines(len(items))
+    try:
+        res = d.api.upload(items, fmt=fmt)
+    finally:
+        d.api._window = None
     if res.get('error'):
         die('the upload failed: %s' % res['error'])
     print('written: %s' % json.dumps(res.get('result') or res, ensure_ascii=False)[:200])
@@ -298,6 +328,10 @@ def cmd_save(d, args):
 
 
 def main(argv=None):
+    try:
+        sys.stdout.reconfigure(line_buffering=True)     # lines appear at once, also when the output goes to a log file
+    except (AttributeError, ValueError):
+        pass
     ap = argparse.ArgumentParser(prog='mdm', description='MiniDisc Manager from the command line.',
                                  formatter_class=argparse.RawDescriptionHelpFormatter, epilog=__doc__.split('\n\n', 1)[1])
     ap.add_argument('--device', default='auto', help="auto (default), himd, netmd, or a number from 'mdm devices'")
